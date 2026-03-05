@@ -1,0 +1,1 @@
+claude mcp add ya-wiki -e YA_WIKI_TOKEN=y0__xCY-eCjqveAAhjhzD4gx-HG0hZzOVCZNWd75WnNI8zaXC4HznUrYg -e YA_WIKI_ORG_ID=674252 -e YA_WIKI_ORG_TYPE=business -- uvx ya-wiki-mcp

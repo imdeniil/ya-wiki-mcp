@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = "https://api.wiki.yandex.net/v1"
+BASE_URL = "https://api.wiki.yandex.net"
 
 
 class WikiAPIError(Exception):
