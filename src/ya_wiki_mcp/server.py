@@ -6,7 +6,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from ya_wiki_mcp import client, converter, prompt_manager
+from ya_wiki_mcp import client, converter, prompt_manager, tree_manager
 from ya_wiki_mcp.client import WikiAPIError
 
 mcp = FastMCP(
@@ -32,6 +32,15 @@ _SYNTAX_FILE = Path(__file__).parent / "docs" / "yfm-syntax.md"
 def yfm_syntax() -> str:
     """Yandex Wiki markup (YFM) syntax reference. Read this before creating or editing page content."""
     return _SYNTAX_FILE.read_text(encoding="utf-8")
+
+
+@mcp.resource("wiki://pages/tree")
+def wiki_pages_tree() -> str:
+    """Wiki page tree structure. Shows all known sections and their hierarchy. Use this to find where to place new content."""
+    tree = tree_manager.load_tree()
+    if not tree:
+        return "Page tree is empty. Use add_tree_section to populate it."
+    return tree_manager.tree_to_text(tree)
 
 
 def _json(data: Any) -> str:
@@ -634,13 +643,116 @@ async def clone_grid(
 
 
 # ---------------------------------------------------------------------------
+# Page Tree
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_tree() -> str:
+    """Get the wiki page tree structure. Returns all known sections and their hierarchy.
+
+    Use this before creating pages to find the best placement. The tree shows section titles, slugs, and nesting.
+    """
+    tree = tree_manager.load_tree()
+    if not tree:
+        return "Page tree is empty. Use add_tree_section to add root sections first."
+    text = tree_manager.tree_to_text(tree)
+    sections = tree_manager.flat_sections(tree)
+    return f"Tree:\n{text}\n\nTotal sections: {len(sections)}"
+
+
+@mcp.tool()
+async def suggest_placement(description: str) -> str:
+    """Suggest where to place a new page in the wiki tree based on its description.
+
+    Returns a ranked list of existing sections that best match the content,
+    plus a suggestion for creating a new section if none fit well.
+    Use this to help the user decide where to put new documentation.
+
+    Args:
+        description: Brief description of the page content to be placed
+    """
+    tree = tree_manager.load_tree()
+    if not tree:
+        return "Page tree is empty. Use add_tree_section to add root sections first, then retry."
+
+    sections = tree_manager.flat_sections(tree)
+    section_list = "\n".join(
+        f"  {i+1}. {s['path']} (slug: {s['slug']})"
+        for i, s in enumerate(sections)
+    )
+    return (
+        f"Content to place: {description}\n\n"
+        f"Available sections:\n{section_list}\n\n"
+        "Based on the content description above, suggest the best matching section "
+        "from the list. If none fit well, propose a new section name and parent slug."
+    )
+
+
+@mcp.tool()
+async def add_tree_section(
+    slug: str,
+    title: str,
+    parent_slug: str | None = None,
+) -> str:
+    """Add a new section to the wiki page tree.
+
+    Args:
+        slug: Section slug (URL path), e.g. "jummy/razrabotka/new-section"
+        title: Section display title, e.g. "New Section"
+        parent_slug: Parent section slug to nest under. If not provided, adds as root section.
+    """
+    try:
+        tree = tree_manager.add_section(slug=slug, title=title, parent_slug=parent_slug)
+        return f"Section '{title}' added. Updated tree:\n{tree_manager.tree_to_text(tree)}"
+    except ValueError as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+async def remove_tree_section(slug: str) -> str:
+    """Remove a section from the wiki page tree.
+
+    Args:
+        slug: Section slug to remove
+    """
+    tree = tree_manager.remove_section(slug)
+    if not tree:
+        return "Section removed. Tree is now empty."
+    return f"Section removed. Updated tree:\n{tree_manager.tree_to_text(tree)}"
+
+
+@mcp.tool()
+async def set_tree(tree_yaml: str) -> str:
+    """Replace the entire wiki page tree from YAML. Use this to bulk-import the tree structure.
+
+    Args:
+        tree_yaml: YAML string with tree structure. Format:
+            - slug: root/section
+              title: Section Name
+              children:
+                - slug: root/section/child
+                  title: Child Name
+    """
+    import yaml
+    try:
+        data = yaml.safe_load(tree_yaml)
+        if not isinstance(data, list):
+            return "Error: YAML must be a list of sections"
+        tree_manager.save_tree(data)
+        return f"Tree updated:\n{tree_manager.tree_to_text(data)}"
+    except yaml.YAMLError as e:
+        return f"Error parsing YAML: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Prompt Manager
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 async def prompts_list() -> str:
-    """List all saved wiki prompt templates."""
+    """List all saved Yandex Wiki prompt templates. These are reusable templates for creating wiki page content."""
     prompts = prompt_manager.list_prompts()
     if not prompts:
         return "No prompts saved yet. Use prompts_add to create one."
@@ -649,7 +761,7 @@ async def prompts_list() -> str:
 
 @mcp.tool()
 async def prompts_get(name: str, arguments: dict[str, str] | None = None) -> str:
-    """Get and render a prompt template with arguments.
+    """Get and render a Yandex Wiki prompt template with arguments. Use for generating wiki page content from templates.
 
     Args:
         name: Prompt name (filename without .md)
@@ -670,7 +782,7 @@ async def prompts_add(
     body: str,
     arguments: list[dict[str, str]] | None = None,
 ) -> str:
-    """Create or update a prompt template.
+    """Create or update a Yandex Wiki prompt template. Templates are used for generating wiki page content.
 
     Args:
         name: Prompt name (will be used as filename, no spaces)
@@ -703,7 +815,7 @@ async def prompts_add(
 
 @mcp.tool()
 async def prompts_add_from_file(name: str, file_path: str) -> str:
-    """Load a prompt template from an existing file. The file should have YAML frontmatter (---) with description and arguments, followed by the prompt body.
+    """Load a Yandex Wiki prompt template from an existing file. The file should have YAML frontmatter (---) with description and arguments, followed by the prompt body.
 
     If the file has no frontmatter, it will be saved as-is with the filename as the prompt name.
 
@@ -722,7 +834,7 @@ async def prompts_add_from_file(name: str, file_path: str) -> str:
 
 @mcp.tool()
 async def prompts_remove(name: str) -> str:
-    """Delete a prompt template.
+    """Delete a Yandex Wiki prompt template.
 
     Args:
         name: Prompt name to delete
