@@ -21,7 +21,15 @@ mcp = FastMCP(
         "IMPORTANT: Yandex Wiki uses YFM (Yandex Flavored Markdown) syntax which differs from standard Markdown.\n"
         "Before creating or updating page content, read the 'yfm-syntax' resource to learn the correct markup.\n"
         "Key differences: notes use {% note %}, collapsible sections use {% cut %}, "
-        "wiki-style tables use #| || |#, colored text uses {color}(text), underline is ++text++."
+        "wiki-style tables use #| || |#, colored text uses {color}(text), underline is ++text++.\n\n"
+        "WORKFLOW for creating documentation:\n"
+        "When the user asks to create a wiki page or write documentation, follow these steps:\n"
+        "1. PLACEMENT: Call get_tree to show the wiki section tree. Ask the user which section to place the page in. "
+        "If unsure, call suggest_placement with a brief description to recommend sections.\n"
+        "2. TEMPLATE: Call prompts_list to show available prompt templates. Ask the user which template to use for generating content.\n"
+        "3. GENERATE: Call prompts_get with the chosen template and arguments to generate the page content.\n"
+        "4. CREATE: Call create_page with the generated content in the chosen section.\n"
+        "Always confirm each step with the user before proceeding to the next."
     ),
 )
 
