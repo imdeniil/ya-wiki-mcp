@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 
-from ya_wiki_mcp import client, converter, prompt_manager, tree_manager
-from ya_wiki_mcp.client import WikiAPIError
+from ya_wiki_mcp import converter, prompt_manager, tree_manager
+from ya_wiki_mcp.client import WikiAPIError, create_client
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "ya-wiki",
@@ -35,6 +39,15 @@ mcp = FastMCP(
 
 _SYNTAX_FILE = Path(__file__).parent / "docs" / "yfm-syntax.md"
 
+_wiki = None
+
+
+def _get_wiki():
+    global _wiki
+    if _wiki is None:
+        _wiki = create_client()
+    return _wiki
+
 
 @mcp.resource("yfm://syntax")
 def yfm_syntax() -> str:
@@ -52,14 +65,73 @@ def wiki_pages_tree() -> str:
 
 
 def _json(data: Any) -> str:
+    if hasattr(data, "model_dump"):
+        data = data.model_dump(exclude_none=True)
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 def _error(e: WikiAPIError) -> str:
-    parts = [f"Error [{e.error_code}]: {e}"]
-    if e.details:
-        parts.append(f"Details: {json.dumps(e.details, ensure_ascii=False)}")
-    return "\n".join(parts)
+    msg = str(e)
+    if isinstance(e.detail, dict):
+        details = e.detail.get("details")
+        if details:
+            msg += f"\nDetails: {json.dumps(details, ensure_ascii=False)}"
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _cache_add(slug: str, title: str) -> None:
+    """Silently add/update a page in the tree cache."""
+    try:
+        tree_manager.upsert_page(slug, title)
+    except Exception:
+        logger.debug("tree cache upsert failed for %s", slug, exc_info=True)
+
+
+def _cache_remove(slug: str) -> None:
+    """Silently remove a page from the tree cache."""
+    try:
+        tree_manager.remove_section(slug)
+    except Exception:
+        logger.debug("tree cache remove failed for %s", slug, exc_info=True)
+
+
+async def _fetch_all_descendants(
+    root_slug: str,
+    *,
+    include_self: bool = True,
+) -> list[dict[str, str]]:
+    """Fetch all descendants with titles from the API. Returns list of {slug, title}."""
+    wiki = _get_wiki()
+
+    # 1. Collect all page identities via pagination
+    identities = []
+    cursor = None
+    while True:
+        result = await wiki.pages.get_descendants_by_slug(
+            root_slug, include_self=include_self, page_size=100, cursor=cursor,
+        )
+        identities.extend(result.results)
+        if not result.next_cursor:
+            break
+        cursor = result.next_cursor
+
+    # 2. Fetch titles in parallel
+    async def _get_title(page_id: int, slug: str) -> dict[str, str]:
+        try:
+            page = await wiki.pages.get_by_id(page_id)
+            return {"slug": slug, "title": page.title or slug.rsplit("/", 1)[-1]}
+        except Exception:
+            return {"slug": slug, "title": slug.rsplit("/", 1)[-1]}
+
+    pages = await asyncio.gather(
+        *[_get_title(p.id, p.slug) for p in identities if p.id and p.slug]
+    )
+    return list(pages)
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +167,15 @@ async def get_page_content(
         page_id: Page numeric ID (alternative to slug)
     """
     try:
-        result = await client.get_page(
-            slug=slug, page_id=page_id, fields="content",
-        )
-        content = result.get("content", "")
-        title = result.get("title", "")
+        wiki = _get_wiki()
+        if page_id is not None:
+            result = await wiki.pages.get_by_id(page_id, fields="content")
+        elif slug is not None:
+            result = await wiki.pages.get(slug, fields="content")
+        else:
+            return "Error: Either slug or page_id must be provided"
+        content = result.content or ""
+        title = result.title or ""
         if title:
             return f"# {title}\n\n{content}"
         return content or "(empty page)"
@@ -130,10 +206,19 @@ async def get_page(
         revision_id: Get specific revision
     """
     try:
-        result = await client.get_page(
-            slug=slug, page_id=page_id, fields=fields,
-            raise_on_redirect=raise_on_redirect, revision_id=revision_id,
-        )
+        wiki = _get_wiki()
+        if page_id is not None:
+            result = await wiki.pages.get_by_id(
+                page_id, fields=fields,
+                raise_on_redirect=raise_on_redirect, revision_id=revision_id,
+            )
+        elif slug is not None:
+            result = await wiki.pages.get(
+                slug, fields=fields,
+                raise_on_redirect=raise_on_redirect, revision_id=revision_id,
+            )
+        else:
+            return "Error: Either slug or page_id must be provided"
         return _json(result)
     except WikiAPIError as e:
         return _error(e)
@@ -165,10 +250,12 @@ async def create_page(
         is_silent: Silent mode (no notifications)
     """
     try:
-        result = await client.create_page(
+        wiki = _get_wiki()
+        result = await wiki.pages.create(
             page_type=page_type, title=title, slug=slug, content=content,
             grid_format=grid_format, cloud_page=cloud_page, fields=fields, is_silent=is_silent,
         )
+        _cache_add(slug, title)
         return _json(result)
     except WikiAPIError as e:
         return _error(e)
@@ -196,10 +283,13 @@ async def update_page(
         is_silent: Silent mode
     """
     try:
-        result = await client.update_page(
-            page_id=page_id, title=title, content=content, redirect=redirect,
+        wiki = _get_wiki()
+        result = await wiki.pages.update(
+            page_id, title=title, content=content, redirect=redirect,
             allow_merge=allow_merge, fields=fields, is_silent=is_silent,
         )
+        if title and hasattr(result, "slug") and result.slug:
+            _cache_add(result.slug, title)
         return _json(result)
     except WikiAPIError as e:
         return _error(e)
@@ -213,7 +303,17 @@ async def delete_page(page_id: int) -> str:
         page_id: Page numeric ID
     """
     try:
-        result = await client.delete_page(page_id=page_id)
+        wiki = _get_wiki()
+        # Get slug before deletion for cache update
+        slug = None
+        try:
+            page_info = await wiki.pages.get_by_id(page_id)
+            slug = page_info.slug
+        except Exception:
+            pass
+        result = await wiki.pages.delete(page_id)
+        if slug:
+            _cache_remove(slug)
         return _json(result)
     except WikiAPIError as e:
         return _error(e)
@@ -235,9 +335,20 @@ async def clone_page(
         subscribe_me: Subscribe to changes on the cloned page
     """
     try:
-        result = await client.clone_page(
-            page_id=page_id, target=target, title=title, subscribe_me=subscribe_me,
+        wiki = _get_wiki()
+        # If no title given, fetch from source page
+        clone_title = title
+        if not clone_title:
+            try:
+                src = await wiki.pages.get_by_id(page_id)
+                clone_title = src.title
+            except Exception:
+                clone_title = target.rsplit("/", 1)[-1]
+        result = await wiki.pages.clone(
+            page_id, target=target, title=title, subscribe_me=subscribe_me,
         )
+        if clone_title:
+            _cache_add(target, clone_title)
         return _json(result)
     except WikiAPIError as e:
         return _error(e)
@@ -271,11 +382,73 @@ async def append_content(
         is_silent: Silent mode
     """
     try:
-        result = await client.append_content(
-            page_id=page_id, content=content, body_location=body_location,
+        wiki = _get_wiki()
+        result = await wiki.pages.append_content(
+            page_id, content=content, location=body_location,
             section_id=section_id, section_location=section_location,
             anchor_name=anchor_name, anchor_fallback=anchor_fallback, anchor_regex=anchor_regex,
             fields=fields, is_silent=is_silent,
+        )
+        return _json(result)
+    except WikiAPIError as e:
+        return _error(e)
+
+
+# ---------------------------------------------------------------------------
+# Page Descendants
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_descendants(
+    page_id: int,
+    actuality: str | None = None,
+    cursor: str | None = None,
+    include_self: bool | None = None,
+    page_size: int | None = None,
+) -> str:
+    """Get all descendant pages (subpages at all levels) of a page by its ID. Returns paginated list of page IDs and slugs.
+
+    Args:
+        page_id: Page numeric ID
+        actuality: Filter by page status: "active" (default), "removed", or "all"
+        cursor: Pagination cursor from previous response (next_cursor/prev_cursor)
+        include_self: Include the parent page itself in results (default false)
+        page_size: Results per page (default 20)
+    """
+    try:
+        wiki = _get_wiki()
+        result = await wiki.pages.get_descendants(
+            page_id, actuality=actuality, cursor=cursor,
+            include_self=include_self, page_size=page_size,
+        )
+        return _json(result)
+    except WikiAPIError as e:
+        return _error(e)
+
+
+@mcp.tool()
+async def get_descendants_by_slug(
+    slug: str,
+    actuality: str | None = None,
+    cursor: str | None = None,
+    include_self: bool | None = None,
+    page_size: int | None = None,
+) -> str:
+    """Get all descendant pages (subpages at all levels) of a page by its slug. Returns paginated list of page IDs and slugs.
+
+    Args:
+        slug: Page slug, e.g. "users/test/page"
+        actuality: Filter by page status: "active" (default), "removed", or "all"
+        cursor: Pagination cursor from previous response (next_cursor/prev_cursor)
+        include_self: Include the parent page itself in results (default false)
+        page_size: Results per page (default 20)
+    """
+    try:
+        wiki = _get_wiki()
+        result = await wiki.pages.get_descendants_by_slug(
+            slug, actuality=actuality, cursor=cursor,
+            include_self=include_self, page_size=page_size,
         )
         return _json(result)
     except WikiAPIError as e:
@@ -293,7 +466,6 @@ async def get_page_resources(
     cursor: str | None = None,
     order_by: str | None = None,
     order_direction: str | None = None,
-    page_num: int | None = None,
     page_size: int | None = None,
     q: str | None = None,
     types: str | None = None,
@@ -305,15 +477,15 @@ async def get_page_resources(
         cursor: Pagination cursor from previous response (next_cursor/prev_cursor)
         order_by: Sort by "name_title" or "created_at"
         order_direction: "asc" or "desc"
-        page_num: Legacy page number (min 1)
         page_size: Results per page (1-50, default 25)
         q: Search by title (max 255 chars)
         types: Filter by type, comma-separated: attachment, sharepoint_resource, grid
     """
     try:
-        result = await client.get_page_resources(
-            page_id=page_id, cursor=cursor, order_by=order_by, order_direction=order_direction,
-            page_num=page_num, page_size=page_size, q=q, types=types,
+        wiki = _get_wiki()
+        result = await wiki.pages.get_resources(
+            page_id, cursor=cursor, order_by=order_by, order_direction=order_direction,
+            page_size=page_size, q=q, types=types,
         )
         return _json(result)
     except WikiAPIError as e:
@@ -326,7 +498,6 @@ async def get_page_grids(
     cursor: str | None = None,
     order_by: str | None = None,
     order_direction: str | None = None,
-    page_num: int | None = None,
     page_size: int | None = None,
 ) -> str:
     """Get grids (dynamic tables) attached to a Yandex Wiki page.
@@ -336,13 +507,13 @@ async def get_page_grids(
         cursor: Pagination cursor
         order_by: Sort by "title" or "created_at"
         order_direction: "asc" or "desc"
-        page_num: Legacy page number (min 1)
         page_size: Results per page (1-50, default 25)
     """
     try:
-        result = await client.get_page_grids(
-            page_id=page_id, cursor=cursor, order_by=order_by, order_direction=order_direction,
-            page_num=page_num, page_size=page_size,
+        wiki = _get_wiki()
+        result = await wiki.pages.get_grids(
+            page_id, cursor=cursor, order_by=order_by, order_direction=order_direction,
+            page_size=page_size,
         )
         return _json(result)
     except WikiAPIError as e:
@@ -368,7 +539,8 @@ async def create_grid(
         page_slug: Parent page slug (alternative to page_id)
     """
     try:
-        result = await client.create_grid(title=title, page_id=page_id, page_slug=page_slug)
+        wiki = _get_wiki()
+        result = await wiki.grids.create(title=title, page_id=page_id, page_slug=page_slug)
         return _json(result)
     except WikiAPIError as e:
         return _error(e)
@@ -396,8 +568,9 @@ async def get_grid(
         sort: Sort rows, e.g. "name, -age" (prefix "-" for desc)
     """
     try:
-        result = await client.get_grid(
-            grid_id=grid_id, fields=fields, filter=filter,
+        wiki = _get_wiki()
+        result = await wiki.grids.get(
+            grid_id, fields=fields, filter=filter,
             only_cols=only_cols, only_rows=only_rows, revision=revision, sort=sort,
         )
         return _json(result)
@@ -421,8 +594,9 @@ async def update_grid(
         default_sort: Default sort config, e.g. [{"column_slug": "asc"}]
     """
     try:
-        result = await client.update_grid(
-            grid_id=grid_id, revision=revision, title=title, default_sort=default_sort,
+        wiki = _get_wiki()
+        result = await wiki.grids.update(
+            grid_id, revision=revision, title=title, default_sort=default_sort,
         )
         return _json(result)
     except WikiAPIError as e:
@@ -437,7 +611,8 @@ async def delete_grid(grid_id: str) -> str:
         grid_id: Grid UUID
     """
     try:
-        await client.delete_grid(grid_id=grid_id)
+        wiki = _get_wiki()
+        await wiki.grids.delete(grid_id)
         return "Grid deleted successfully"
     except WikiAPIError as e:
         return _error(e)
@@ -461,8 +636,9 @@ async def add_rows(
         after_row_id: Insert after this row ID
     """
     try:
-        result = await client.add_rows(
-            grid_id=grid_id, rows=rows, revision=revision,
+        wiki = _get_wiki()
+        result = await wiki.grids.rows.add(
+            grid_id, rows=rows, revision=revision,
             position=position, after_row_id=after_row_id,
         )
         return _json(result)
@@ -484,7 +660,8 @@ async def delete_rows(
         revision: Current revision string
     """
     try:
-        result = await client.delete_rows(grid_id=grid_id, row_ids=row_ids, revision=revision)
+        wiki = _get_wiki()
+        result = await wiki.grids.rows.delete(grid_id, row_ids=row_ids, revision=revision)
         return _json(result)
     except WikiAPIError as e:
         return _error(e)
@@ -516,8 +693,9 @@ async def add_columns(
         position: Insert at position (0-based)
     """
     try:
-        result = await client.add_columns(
-            grid_id=grid_id, columns=columns, revision=revision, position=position,
+        wiki = _get_wiki()
+        result = await wiki.grids.columns.add(
+            grid_id, columns=columns, revision=revision, position=position,
         )
         return _json(result)
     except WikiAPIError as e:
@@ -538,8 +716,9 @@ async def delete_columns(
         revision: Current revision string
     """
     try:
-        result = await client.delete_columns(
-            grid_id=grid_id, column_slugs=column_slugs, revision=revision,
+        wiki = _get_wiki()
+        result = await wiki.grids.columns.delete(
+            grid_id, column_slugs=column_slugs, revision=revision,
         )
         return _json(result)
     except WikiAPIError as e:
@@ -564,7 +743,8 @@ async def update_cells(
         revision: Current revision string
     """
     try:
-        result = await client.update_cells(grid_id=grid_id, cells=cells, revision=revision)
+        wiki = _get_wiki()
+        result = await wiki.grids.cells.update(grid_id, cells=cells, revision=revision)
         return _json(result)
     except WikiAPIError as e:
         return _error(e)
@@ -590,8 +770,9 @@ async def move_rows(
         rows_count: Number of consecutive rows to move (default 1)
     """
     try:
-        result = await client.move_rows(
-            grid_id=grid_id, row_id=row_id, revision=revision,
+        wiki = _get_wiki()
+        result = await wiki.grids.rows.move(
+            grid_id, row_id=row_id, revision=revision,
             position=position, after_row_id=after_row_id, rows_count=rows_count,
         )
         return _json(result)
@@ -617,8 +798,9 @@ async def move_columns(
         columns_count: Number of consecutive columns to move (default 1)
     """
     try:
-        result = await client.move_columns(
-            grid_id=grid_id, column_slug=column_slug, revision=revision,
+        wiki = _get_wiki()
+        result = await wiki.grids.columns.move(
+            grid_id, column_slug=column_slug, revision=revision,
             position=position, columns_count=columns_count,
         )
         return _json(result)
@@ -642,8 +824,9 @@ async def clone_grid(
         with_data: Copy row data too (default false, copies only structure)
     """
     try:
-        result = await client.clone_grid(
-            grid_id=grid_id, target=target, title=title, with_data=with_data,
+        wiki = _get_wiki()
+        result = await wiki.grids.clone(
+            grid_id, target=target, title=title, with_data=with_data,
         )
         return _json(result)
     except WikiAPIError as e:
@@ -656,17 +839,62 @@ async def clone_grid(
 
 
 @mcp.tool()
-async def get_tree() -> str:
+async def get_tree(use_cache: bool = True) -> str:
     """Get the wiki page tree structure. Returns all known sections and their hierarchy.
 
     Use this before creating pages to find the best placement. The tree shows section titles, slugs, and nesting.
+
+    Args:
+        use_cache: If true (default), return cached tree from local YAML. If false, fetch fresh tree from API (slower but up-to-date). Requires a root section in cache to know which slug to query.
     """
+    if not use_cache:
+        # Determine root slug from existing cache
+        tree = tree_manager.load_tree()
+        if not tree:
+            return "Cannot refresh: tree cache is empty — no root slug known. Use refresh_tree_cache(root_slug) to initialize."
+        root_slug = tree[0]["slug"]
+        try:
+            pages = await _fetch_all_descendants(root_slug, include_self=True)
+            tree = tree_manager.build_tree_from_pages(pages)
+            tree_manager.save_tree(tree)
+        except WikiAPIError as e:
+            return f"Refresh failed: {_error(e)}\n\nReturning cached tree instead.\n\n{tree_manager.tree_to_text(tree_manager.load_tree())}"
+
     tree = tree_manager.load_tree()
     if not tree:
-        return "Page tree is empty. Use add_tree_section to add root sections first."
+        return "Page tree is empty. Use add_tree_section or refresh_tree_cache to populate it."
     text = tree_manager.tree_to_text(tree)
     sections = tree_manager.flat_sections(tree)
-    return f"Tree:\n{text}\n\nTotal sections: {len(sections)}"
+    return f"Tree ({('cached' if use_cache else 'fresh from API')}):\n{text}\n\nTotal sections: {len(sections)}"
+
+
+@mcp.tool()
+async def refresh_tree_cache(root_slug: str) -> str:
+    """Force refresh the entire wiki page tree cache from the API.
+
+    Fetches all descendant pages under root_slug, retrieves their titles, and rebuilds the tree cache.
+    This is slower than get_tree (makes N+1 API calls) but ensures the cache matches the real wiki.
+
+    Args:
+        root_slug: Root page slug to start from, e.g. "jummy"
+    """
+    try:
+        pages = await _fetch_all_descendants(root_slug, include_self=True)
+        if not pages:
+            return f"No pages found under '{root_slug}'."
+        tree = tree_manager.build_tree_from_pages(pages)
+        tree_manager.save_tree(tree)
+        sections = tree_manager.flat_sections(tree)
+        return f"Cache refreshed: {len(sections)} sections from '{root_slug}'.\n\n{tree_manager.tree_to_text(tree)}"
+    except WikiAPIError as e:
+        return _error(e)
+
+
+@mcp.tool()
+async def clear_tree_cache() -> str:
+    """Clear the wiki page tree cache. The cache will be empty until refreshed or manually populated."""
+    tree_manager.clear_tree()
+    return "Tree cache cleared."
 
 
 @mcp.tool()
@@ -799,11 +1027,6 @@ async def prompts_add(
         arguments: Optional list of arguments, each with "name", "description", and optionally "required" (bool).
             Example: [{"name": "topic", "description": "Page topic", "required": "true"}]
     """
-    # Build frontmatter
-    meta = {"description": description}
-    if arguments:
-        meta["arguments"] = arguments
-
     lines = ["---"]
     lines.append(f"description: {description}")
     if arguments:
