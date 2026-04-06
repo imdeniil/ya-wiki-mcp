@@ -125,7 +125,7 @@ You can set these in a `.env` file or pass via `-e` flags.
 
 ## Page Tree Cache
 
-The server maintains a local tree cache (`tree.yaml`) that maps your wiki's section hierarchy. This cache is used by `get_tree` and `suggest_placement` to help with page navigation and placement.
+The server maintains a local tree cache at `~/.cache/ya-wiki-mcp/tree.yaml` that maps your wiki's section hierarchy. This cache is shared across all terminal sessions and is used by `get_tree` and `suggest_placement` to help with page navigation and placement.
 
 **Auto-sync**: The cache updates automatically when you create, update, delete, or clone pages through the MCP tools.
 

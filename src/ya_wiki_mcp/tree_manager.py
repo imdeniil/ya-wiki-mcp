@@ -21,11 +21,13 @@ from typing import Any
 
 import yaml
 
-TREE_FILE = Path(__file__).parent / "tree.yaml"
+CACHE_DIR = Path.home() / ".cache" / "ya-wiki-mcp"
+TREE_FILE = CACHE_DIR / "tree.yaml"
 
 
 def _ensure_file() -> None:
     if not TREE_FILE.exists():
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         TREE_FILE.write_text("# Wiki page tree\n[]\n", encoding="utf-8")
 
 
@@ -36,6 +38,7 @@ def load_tree() -> list[dict[str, Any]]:
 
 
 def save_tree(tree: list[dict[str, Any]]) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TREE_FILE.write_text(
         yaml.dump(tree, allow_unicode=True, default_flow_style=False, sort_keys=False),
         encoding="utf-8",
@@ -45,6 +48,7 @@ def save_tree(tree: list[dict[str, Any]]) -> Path:
 
 def clear_tree() -> None:
     """Reset tree cache to empty."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TREE_FILE.write_text("# Wiki page tree\n[]\n", encoding="utf-8")
 
 

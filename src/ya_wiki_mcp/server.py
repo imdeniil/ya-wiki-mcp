@@ -176,7 +176,7 @@ async def get_page_content(
             return "Error: Either slug or page_id must be provided"
         content = result.content or ""
         title = result.title or ""
-        if title:
+        if title and not content.lstrip().startswith(f"# {title}"):
             return f"# {title}\n\n{content}"
         return content or "(empty page)"
     except WikiAPIError as e:

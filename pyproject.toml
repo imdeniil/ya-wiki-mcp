@@ -1,6 +1,6 @@
 [project]
 name = "ya-wiki-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP server for Yandex Wiki API — pages, grids, YFM syntax, prompt templates"
 requires-python = ">=3.11"
 license = "MIT"

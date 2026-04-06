@@ -1,9 +1,0 @@
-- slug: jummy
-  title: Jummy
-  children:
-  - slug: jummy/razrabotka
-    title: Разработка
-    children:
-    - slug: jummy/razrabotka/jandekswiki
-      title: Яндекс Вики
-      children: []
